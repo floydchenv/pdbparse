@@ -31,6 +31,16 @@ static std::string get_pdb_path(const module_t &module_info, bool is_wow64)
 	if (!pdb_path.empty())
 		return pdb_path;
 
+	auto does_file_exist = [](std::string_view path) { return GetFileAttributes(path.data()) != INVALID_FILE_ATTRIBUTES; };
+
+	//try same dir
+	auto same_dir_pdb_path = module_info.path.substr(0, module_info.path.length() - 4) + ".pdb";
+	if (does_file_exist(same_dir_pdb_path))
+	{
+		pdb_path = same_dir_pdb_path;
+		return pdb_path;
+	}
+
 	//get tmp folder
 	static std::string tmp_folder_path;
 
@@ -42,7 +52,6 @@ static std::string get_pdb_path(const module_t &module_info, bool is_wow64)
 		tmp_folder_path = folder_buff;
 	}
 
-	auto does_file_exist = [](std::string_view path) { return GetFileAttributes(path.data()) != INVALID_FILE_ATTRIBUTES; };
 
 	//determine PDB path by checking debug directory
 	const uintptr_t debug_directory = (is_wow64 ? module_info.ImageHeaders.image_headers32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress : module_info.ImageHeaders.image_headers64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress);
@@ -236,6 +245,94 @@ uintptr_t pdb_parse::get_address_from_symbol(std::string_view function_name, con
 	}
 
 	return 0;
+}
+
+std::string pdb_parse::get_symbol_from_address(uintptr_t address, const module_t& module_info, bool is_wow64)
+{
+	if (!module_info || !address)
+		return "";
+
+	// 获取模块大小
+	size_t module_size = is_wow64 ?
+		module_info.ImageHeaders.image_headers32->OptionalHeader.SizeOfImage :
+		module_info.ImageHeaders.image_headers64->OptionalHeader.SizeOfImage;
+
+	// 检查地址是否在模块范围内
+	if (address < module_info.module_base ||
+		address >(module_info.module_base + module_size))
+		return "";
+
+	// Convert absolute address to RVA
+	uintptr_t relative_address = address - module_info.module_base;
+
+	// First check cached info
+	auto& module_cache = cached_info[module_info.path];
+	for (const auto& [func_name, func_rva] : module_cache.first)
+	{
+		if (func_rva == relative_address)
+		{
+			//return func_name;
+		}
+	}
+
+	// Init COM stuff
+	{
+		static auto has_initialized = false;
+		if (!has_initialized)
+		{
+			CoInitialize(nullptr);
+			has_initialized = true;
+		}
+	}
+
+	const auto pdb_path = get_pdb_path(module_info, is_wow64);
+	if (pdb_path.empty())
+		return "";
+
+	// Create DIA objects
+	CComPtr<IDiaDataSource> source;
+	if (FAILED(CoCreateInstance(CLSID_DiaSource, NULL, CLSCTX_INPROC_SERVER,
+		__uuidof(IDiaDataSource), (void**)&source)))
+		return "";
+
+	{
+		wchar_t wide_path[MAX_PATH];
+		memset(wide_path, 0, MAX_PATH * 2);
+		MultiByteToWideChar(CP_ACP, 0, pdb_path.c_str(), (int)pdb_path.length(),
+			wide_path, MAX_PATH);
+		if (FAILED(source->loadDataFromPdb(wide_path)))
+			return "";
+	}
+
+	CComPtr<IDiaSession> session;
+	if (FAILED(source->openSession(&session)))
+		return "";
+
+	// Find symbol by RVA
+	CComPtr<IDiaSymbol> symbol;
+	if (FAILED(session->findSymbolByRVA(relative_address, SymTagNull, &symbol)))
+		return "";
+
+	// Get symbol name
+	BSTR name_bstr;
+	if (FAILED(symbol->get_name(&name_bstr)))
+		return "";
+
+	// Convert BSTR to string
+	std::string symbol_name;
+	{
+		char buffer[1024];
+		WideCharToMultiByte(CP_UTF8, 0, name_bstr, -1, buffer,
+			sizeof(buffer), NULL, NULL);
+		symbol_name = buffer;
+		SysFreeString(name_bstr);
+	}
+
+	// Cache the result
+	if (!symbol_name.empty())
+		module_cache.first[symbol_name] = relative_address;
+
+	return symbol_name;
 }
 
 void pdb_parse::clear_info()

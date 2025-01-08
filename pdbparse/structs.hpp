@@ -10,6 +10,9 @@ struct module_t
 	//the modules's address in the process
 	uintptr_t module_base = 0;
 
+	//size of the module in memory
+	size_t module_size = 0;
+
 	//a pointer to the bytes of the DLL on disk
 	std::unique_ptr<uint8_t[]> module_on_disk = nullptr;
 
